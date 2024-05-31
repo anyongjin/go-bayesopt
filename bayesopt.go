@@ -1,6 +1,7 @@
 package bayesopt
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -17,6 +18,8 @@ const (
 	DefaultRandomRounds = 5
 	// DefaultMinimize is the default value of minimize.
 	DefaultMinimize = true
+	// DefaultParallel is the default value of max number goroutines run parallelly.
+	DefaultParallel = 5
 
 	NumRandPoints = 100000
 	NumGradPoints = 256
@@ -39,6 +42,7 @@ type Optimizer struct {
 		exploration                 Exploration
 		minimize                    bool
 		barrierFunc                 BarrierFunc
+		parallel                    int
 
 		running        bool
 		explorationErr error
@@ -92,6 +96,13 @@ func WithBarrierFunc(bf BarrierFunc) OptimizerOption {
 	}
 }
 
+// WithParallel sets max number of running goroutines parallelly.
+func WithParallel(num int) OptimizerOption {
+	return func(o *Optimizer) {
+		o.mu.parallel = num
+	}
+}
+
 // New creates a new optimizer with the specified optimizable parameters and
 // options.
 func New(params []Param, opts ...OptimizerOption) *Optimizer {
@@ -104,12 +115,17 @@ func New(params []Param, opts ...OptimizerOption) *Optimizer {
 	o.mu.rounds = DefaultRounds
 	o.mu.exploration = DefaultExploration
 	o.mu.minimize = DefaultMinimize
+	o.mu.parallel = DefaultParallel
 	o.mu.barrierFunc = DefaultBarrierFunc
 
 	o.updateNames("")
 
 	for _, opt := range opts {
 		opt(o)
+	}
+
+	if o.mu.parallel <= 0 {
+		panic(fmt.Sprintf("parallel must >= 1, current: %v", o.mu.parallel))
 	}
 
 	return o
@@ -323,6 +339,7 @@ func (o *Optimizer) Optimize(f func(map[Param]float64) float64) (x map[Param]flo
 	o.mu.running = true
 	o.mu.Unlock()
 
+	guard := make(chan struct{}, o.mu.parallel)
 	var wg sync.WaitGroup
 	for {
 		if !o.Running() {
@@ -337,9 +354,13 @@ func (o *Optimizer) Optimize(f func(map[Param]float64) float64) (x map[Param]flo
 			break
 		}
 		if parallel {
+			guard <- struct{}{}
 			wg.Add(1)
 			go func() {
-				defer wg.Done()
+				defer func() {
+					<-guard
+					wg.Done()
+				}()
 
 				o.Log(x, f(x))
 			}()
